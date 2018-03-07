@@ -1,5 +1,8 @@
 import dogdataset
+import vgg
 import sys
+# import models
+import  torchvision.models as models
 import os
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -14,26 +17,34 @@ import torch.nn.functional as F
 
 
 def main():
-    lr = 0.0005
-    batch_size = 20
+    lr = 0.0001
+    batch_size = 30
     test_batch_size = 20
     model_save_dir = sys.argv[1]
     if not os.path.exists(model_save_dir):
         os.mkdir(model_save_dir)
-    net = resnet.ResNet18()
-    train_dataset = dogdataset.DogDataset('./data/train/', './data/labels.csv')
+    net = models.resnet50(num_classes=120, pretrained=True)
+    net = torch.nn.DataParallel(net, device_ids=[0, 1])
+    # net = vgg.MyVGG()
+    net = net.cuda()
+    train_dataset = dogdataset.TrainDataSet('./data_gen/train/')
+    test_dataset = dogdataset.TestDataset('./data/train/', './data/test.csv')
 
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, \
-            shuffle=True, num_workers=10, pin_memory=True, drop_last=True)
-    net.cuda()
-    criterion = nn.CrossEntropyLoss().cuda()
-    optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, nesterov=True)
+            shuffle=True, num_workers=10, pin_memory=True, drop_last=False)
+    test_loader = DataLoader(test_dataset, batch_size=10, \
+            shuffle=False, num_workers=10, pin_memory=True, drop_last=True)
+    ce_weight = test_dataset.ce_weight
+    criterion = nn.CrossEntropyLoss(torch.from_numpy(np.array(ce_weight))).cuda()
+    # criterion = nn.CrossEntropyLoss().cuda()
+    optimizer = torch.optim.SGD(net.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4, nesterov=True)
+    # optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-4)
     
     print 'start to run'
     step = 0
-    train_target_constant = Variable(torch.ones(batch_size).cuda())
-    for epoch in range(100):
+    net.load_state_dict(torch.load('./checkpoints/dense_weightedloss/model-4000'))
+    for epoch in range(300):
         net.train()
         for i, data in enumerate(train_loader):
             step += 1
@@ -44,7 +55,7 @@ def main():
             optimizer.zero_grad()
             loss = criterion(predicted, labels)
             if step % 50 == 0:
-                print 'at step %s loss: '%step, loss.data[0]
+                print 'at step %s loss: '%step, loss.data[0], 'lr: %s'%lr, 'acc: ', predicted.data.max(1)[1].eq(labels.data).cpu().sum()/float(batch_size)
                 # acc = (s_pos.round()==train_target_constant).type(torch.FloatTensor)
                 # acc2 = (s_neg.round()==train_target_constant-train_target_constant).type(torch.FloatTensor)
                 # acc = (acc+acc2)/2
@@ -52,34 +63,23 @@ def main():
                 
             loss.backward()
             optimizer.step()
-            lr = lr*0.86**(1e-4)
-            # if step % 1000 == 0:
-                # acc_ = 0
-                # for i_test, data_test in enumerate(test_loader):
-                    # net.eval()
-                    # x_b_test = data_test[:, 0]
-                    # x_p_test = data_test[:, 1]
-                    # x_n_test = data_test[:, 2]
-                    # x_b_test = Variable(x_b_test.cuda())
-                    # x_p_test = Variable(x_p_test.cuda())
-                    # x_n_test = Variable(x_n_test.cuda())
+            lr = lr*0.9**(1e-4)
+            if step % 600 == 0:
+                net.eval()
+                correct = 0
+                loss_ = 0
+                for i_test, data_test in enumerate(test_loader):
+                    imgs_test = Variable(data_test[0].cuda())
+                    labels_test = Variable(data_test[1].cuda())
+                    results = net(imgs_test)
+                    loss = criterion(results, labels_test)
+                    loss_ += loss.data[0]
+                    predict = results.data.max(1)[1]
+                    correct += predict.eq(labels_test.data).cpu().sum()
+                print 'test acc is :', float(correct) / 990, 'loss is : ', float(loss_) / i_test
+                net.train()
 
-                    # y_b = net(x_b_test)
-                    # y_p = net(x_p_test)
-                    # y_n = net(x_n_test)
-                    # s_pos = cos_similarity(y_b, y_p)
-                    # s_neg = cos_similarity(y_b, y_n)
-                    # acc = (s_pos.round()==test_target_constant).type(torch.FloatTensor)
-                    # acc2 = (s_neg.round()==test_target_constant-test_target_constant).type(torch.FloatTensor)
-                    # acc = (acc+acc2)/2
-                    # acc_ += acc.mean().data[0]
-                    # del x_b_test, x_p_test, x_n_test, s_pos, s_neg, acc, acc2, y_b, y_p, y_n
-                    
-                # # print 'test acc is :', acc_ / len(test_loader)
-                # print 'test acc is :', acc_ / len(test_loader)
-                # net.train()
-
-            if step % 10000 == 0:
+            if step % 2000 == 0:
                 torch.save(net.state_dict(), os.path.join(model_save_dir, 'model-%s'%step))
 
             for param_group in optimizer.param_groups:
